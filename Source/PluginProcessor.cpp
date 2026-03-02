@@ -1,3 +1,12 @@
+/*
+  ==============================================================================
+
+    Alpaca VST3 Plugin
+    Copyright (c) 2026 Alpaca Audio
+
+  ==============================================================================
+*/
+
 #include "PluginProcessor.h"
 
 #include <juce_audio_utils/juce_audio_utils.h>
@@ -81,10 +90,6 @@ void AlpacaAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
 {
     juce::ignoreUnused(midiMessages);
     juce::ScopedNoDenormals noDenormals;
-
-    for (auto channel = getTotalNumInputChannels(); channel < getTotalNumOutputChannels();
-         ++channel)
-        buffer.clear(channel, 0, buffer.getNumSamples());
 
     buffer.clear();
 }

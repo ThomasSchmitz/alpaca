@@ -1,3 +1,12 @@
+/*
+  ==============================================================================
+
+    Alpaca VST3 Plugin
+    Copyright (c) 2026 Alpaca Audio
+
+  ==============================================================================
+*/
+
 #pragma once
 
 #include <juce_audio_processors/juce_audio_processors.h>

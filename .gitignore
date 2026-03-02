@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+
+# User specific
+*.user
+*.local
+*.DS_Store
+
+# Generated binaries
+*.vst3
+*.component
+*.dll
+*.exe
+*.app
+*.log

@@ -9,12 +9,588 @@
 
 #include "PluginProcessor.h"
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cmath>
 #include <juce_audio_utils/juce_audio_utils.h>
+
+namespace
+{
+constexpr float kPitchBendRangeSemitones = 2.0f;
+constexpr size_t kMaxHeldNotes = 32;
+constexpr float kMinEnvelopeLevel = 1.0e-5f;
+
+struct ParamSnapshot
+{
+    float glideMs = 0.0f;
+    float vibratoDepth = 0.0f;
+    float vibratoRateHz = 0.0f;
+    float attackMs = 0.0f;
+    float releaseMs = 0.0f;
+    float outputGainDb = 0.0f;
+    int monoPriorityIndex = 0;
+    int midiChannelChoice = 0;
+
+    static ParamSnapshot from(const juce::AudioProcessorValueTreeState& state)
+    {
+        const auto get = [&](const char* id) { return state.getRawParameterValue(id)->load(); };
+
+        ParamSnapshot snapshot;
+        snapshot.glideMs = get("glide_ms");
+        snapshot.vibratoDepth = get("vibrato_depth");
+        snapshot.vibratoRateHz = get("vibrato_rate_hz");
+        snapshot.attackMs = get("amp_attack_ms");
+        snapshot.releaseMs = get("amp_release_ms");
+        snapshot.outputGainDb = get("output_gain_db");
+        snapshot.monoPriorityIndex = static_cast<int>(state.getRawParameterValue("mono_priority")->load());
+        snapshot.midiChannelChoice = static_cast<int>(state.getRawParameterValue("midi_channel")->load());
+        return snapshot;
+    }
+
+    float vibratoDepthSemitones() const { return vibratoDepth * 2.0f; }
+
+    int midiChannel() const { return midiChannelChoice == 0 ? 0 : midiChannelChoice; }
+};
+
+float midiNoteToFrequency(int noteNumber)
+{
+    return 440.0f * std::pow(2.0f, (static_cast<float>(noteNumber) - 69.0f) / 12.0f);
+}
+
+float calculateGlideCoefficient(float glideTimeMs, double sampleRate)
+{
+    if (glideTimeMs <= 0.0f || sampleRate <= 0.0)
+        return 1.0f;
+
+    const auto tauSeconds = glideTimeMs / 1000.0f;
+    const auto coeff = 1.0f - std::exp(-1.0f / (tauSeconds * static_cast<float>(sampleRate)));
+    return juce::jlimit(0.0f, 1.0f, coeff);
+}
+
+float applyPitchBend(float baseFrequency, int pitchBendValue)
+{
+    const auto bendNorm = (static_cast<float>(pitchBendValue) - 8192.0f) / 8192.0f;
+    const auto semitones = bendNorm * kPitchBendRangeSemitones;
+    return baseFrequency * std::pow(2.0f, semitones / 12.0f);
+}
+
+float applyVibrato(float baseFrequency, float lfoValue, float depthSemitones)
+{
+    if (depthSemitones <= 0.0f)
+        return baseFrequency;
+
+    return baseFrequency * std::pow(2.0f, (depthSemitones * lfoValue) / 12.0f);
+}
+
+class MonoNoteManager
+{
+public:
+    enum class Priority
+    {
+        Last,
+        Low,
+        High
+    };
+
+    struct NoteChange
+    {
+        bool hasNote = false;
+        int note = -1;
+        juce::uint8 velocity = 0;
+        bool noteChanged = false;
+        bool retriggerEnvelope = false;
+    };
+
+    void setPriority(Priority newPriority) { priority = newPriority; }
+
+    NoteChange noteOn(int note, juce::uint8 velocity)
+    {
+        const bool hadNote = numActive > 0;
+        const auto previousNote = activeNote;
+
+        if (const auto idx = findIndex(note); idx >= 0)
+        {
+            notes[static_cast<size_t>(idx)].velocity = velocity;
+            notes[static_cast<size_t>(idx)].order = ++orderCounter;
+        }
+        else
+        {
+            if (numActive < notes.size())
+                notes[numActive++] = {note, velocity, ++orderCounter};
+            else
+                notes.back() = {note, velocity, ++orderCounter};
+        }
+
+        selectActiveNote();
+
+        NoteChange change;
+        change.hasNote = numActive > 0;
+        change.note = activeNote;
+        change.velocity = activeVelocity;
+        change.noteChanged = activeNote != previousNote || note == previousNote;
+        change.retriggerEnvelope = !hadNote || note == previousNote;
+        return change;
+    }
+
+    NoteChange noteOff(int note)
+    {
+        const auto previousNote = activeNote;
+
+        if (const auto idx = findIndex(note); idx >= 0)
+        {
+            for (size_t i = static_cast<size_t>(idx); i + 1 < numActive; ++i)
+                notes[i] = notes[i + 1];
+
+            if (numActive > 0)
+                --numActive;
+        }
+
+        selectActiveNote();
+
+        NoteChange change;
+        change.hasNote = numActive > 0;
+        change.note = activeNote;
+        change.velocity = activeVelocity;
+        change.noteChanged = activeNote != previousNote;
+        change.retriggerEnvelope = false;
+        return change;
+    }
+
+    void allNotesOff()
+    {
+        numActive = 0;
+        activeNote = -1;
+        activeVelocity = 0;
+    }
+
+    bool hasActiveNote() const { return numActive > 0; }
+    int currentNote() const { return activeNote; }
+    juce::uint8 currentVelocity() const { return activeVelocity; }
+
+private:
+    struct ActiveNote
+    {
+        int note = -1;
+        juce::uint8 velocity = 0;
+        std::uint64_t order = 0;
+    };
+
+    int findIndex(int note) const
+    {
+        for (size_t i = 0; i < numActive; ++i)
+        {
+            if (notes[i].note == note)
+                return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    int chooseIndex() const
+    {
+        if (numActive == 0)
+            return -1;
+
+        size_t best = 0;
+
+        switch (priority)
+        {
+            case Priority::Last:
+                for (size_t i = 1; i < numActive; ++i)
+                {
+                    if (notes[i].order > notes[best].order)
+                        best = i;
+                }
+                break;
+            case Priority::Low:
+                for (size_t i = 1; i < numActive; ++i)
+                {
+                    if (notes[i].note < notes[best].note)
+                        best = i;
+                }
+                break;
+            case Priority::High:
+                for (size_t i = 1; i < numActive; ++i)
+                {
+                    if (notes[i].note > notes[best].note)
+                        best = i;
+                }
+                break;
+        }
+
+        return static_cast<int>(best);
+    }
+
+    void selectActiveNote()
+    {
+        const auto idx = chooseIndex();
+        if (idx < 0)
+        {
+            activeNote = -1;
+            activeVelocity = 0;
+            return;
+        }
+
+        activeNote = notes[static_cast<size_t>(idx)].note;
+        activeVelocity = notes[static_cast<size_t>(idx)].velocity;
+    }
+
+    std::array<ActiveNote, kMaxHeldNotes> notes{};
+    size_t numActive = 0;
+    Priority priority = Priority::Last;
+    std::uint64_t orderCounter = 0;
+    int activeNote = -1;
+    juce::uint8 activeVelocity = 0;
+};
+
+class BandlimitedSaw
+{
+public:
+    void prepare(double newSampleRate)
+    {
+        sampleRate = newSampleRate;
+        phase = 0.0f;
+    }
+
+    void setFrequency(float frequency)
+    {
+        const auto increment = frequency / static_cast<float>(sampleRate);
+        phaseIncrement = std::clamp(increment, 0.0f, 0.5f);
+    }
+
+    float processSample()
+    {
+        const auto t = phase;
+        float value = 2.0f * t - 1.0f;
+
+        value -= polyBlep(t);
+        value += polyBlep(t + phaseIncrement);
+
+        phase += phaseIncrement;
+        if (phase >= 1.0f)
+            phase -= 1.0f;
+
+        return value;
+    }
+
+    void reset() { phase = 0.0f; }
+
+private:
+    float polyBlep(float t) const
+    {
+        if (phaseIncrement <= 0.0f)
+            return 0.0f;
+
+        if (t < phaseIncrement)
+        {
+            t /= phaseIncrement;
+            return t + t - t * t - 1.0f;
+        }
+
+        if (t > 1.0f - phaseIncrement)
+        {
+            t = (t - 1.0f) / phaseIncrement;
+            return t * t + t + t + 1.0f;
+        }
+
+        return 0.0f;
+    }
+
+    double sampleRate = 44100.0;
+    float phase = 0.0f;
+    float phaseIncrement = 0.0f;
+};
+
+class VibratoLFO
+{
+public:
+    void prepare(double newSampleRate)
+    {
+        sampleRate = newSampleRate;
+        reset();
+    }
+
+    void setRateHz(float rateHz) { phaseIncrement = rateHz / static_cast<float>(sampleRate); }
+
+    float processSample()
+    {
+        const auto output = std::sin(juce::MathConstants<float>::twoPi * phase);
+        phase += phaseIncrement;
+        if (phase >= 1.0f)
+            phase -= 1.0f;
+
+        return output;
+    }
+
+    void reset() { phase = 0.0f; }
+
+private:
+    double sampleRate = 44100.0;
+    float phase = 0.0f;
+    float phaseIncrement = 0.0f;
+};
+
+class AREnvelope
+{
+public:
+    void prepare(double newSampleRate) { sampleRate = newSampleRate; }
+
+    void setAttackMs(float ms) { attackCoeff = calculateGlideCoefficient(ms, sampleRate); }
+    void setReleaseMs(float ms) { releaseCoeff = calculateGlideCoefficient(ms, sampleRate); }
+
+    void noteOn(bool retrigger)
+    {
+        gate = true;
+        if (retrigger)
+        {
+            state = State::Attack;
+            level = 0.0f;
+            return;
+        }
+
+        state = level < 1.0f ? State::Attack : State::Sustain;
+    }
+
+    void noteOff()
+    {
+        gate = false;
+        state = State::Release;
+    }
+
+    float process()
+    {
+        switch (state)
+        {
+            case State::Idle:
+                level = 0.0f;
+                break;
+            case State::Attack:
+                level += (1.0f - level) * attackCoeff;
+                if (level >= 0.999f)
+                {
+                    level = 1.0f;
+                    state = gate ? State::Sustain : State::Release;
+                }
+                break;
+            case State::Sustain:
+                level = 1.0f;
+                break;
+            case State::Release:
+                level += (0.0f - level) * releaseCoeff;
+                if (level < kMinEnvelopeLevel)
+                {
+                    level = 0.0f;
+                    state = State::Idle;
+                }
+                break;
+        }
+
+        return level;
+    }
+
+    bool isActive() const { return state != State::Idle && level > kMinEnvelopeLevel; }
+
+    void reset()
+    {
+        level = 0.0f;
+        state = State::Idle;
+        gate = false;
+    }
+
+private:
+    enum class State
+    {
+        Idle,
+        Attack,
+        Sustain,
+        Release
+    };
+
+    double sampleRate = 44100.0;
+    float attackCoeff = 1.0f;
+    float releaseCoeff = 1.0f;
+    float level = 0.0f;
+    State state = State::Idle;
+    bool gate = false;
+};
+
+}  // namespace
+
+class VoiceEngine
+{
+public:
+    void prepare(double newSampleRate)
+    {
+        sampleRate = newSampleRate;
+        oscillator.prepare(sampleRate);
+        vibrato.prepare(sampleRate);
+        envelope.prepare(sampleRate);
+    }
+
+    void reset()
+    {
+        noteManager.allNotesOff();
+        envelope.reset();
+        vibrato.reset();
+        oscillator.reset();
+        currentFrequency = 0.0f;
+        targetFrequency = 0.0f;
+        pitchBendValue = 8192;
+        velocityScale = 0.0f;
+        std::fill(ccValues.begin(), ccValues.end(), 0);
+    }
+
+    void setPriority(MonoNoteManager::Priority priority) { noteManager.setPriority(priority); }
+
+    void updateParameters(const ParamSnapshot& snapshot)
+    {
+        glideCoeff = calculateGlideCoefficient(snapshot.glideMs, sampleRate);
+        vibratoDepthSemitones = snapshot.vibratoDepthSemitones();
+        vibrato.setRateHz(snapshot.vibratoRateHz);
+        envelope.setAttackMs(snapshot.attackMs);
+        envelope.setReleaseMs(snapshot.releaseMs);
+        outputGain = juce::Decibels::decibelsToGain(snapshot.outputGainDb);
+        midiChannel = snapshot.midiChannel();
+    }
+
+    void processMidiMessage(const juce::MidiMessage& message)
+    {
+        if (midiChannel != 0 && message.getChannel() != midiChannel)
+            return;
+
+        if (message.isAllNotesOff() || message.isAllSoundOff())
+        {
+            noteManager.allNotesOff();
+            envelope.noteOff();
+            velocityScale = 0.0f;
+            return;
+        }
+
+        if (message.isPitchWheel())
+        {
+            pitchBendValue = message.getPitchWheelValue();
+            return;
+        }
+
+        if (message.isController())
+        {
+            const auto controller = message.getControllerNumber();
+            if (controller >= 0 && controller < static_cast<int>(ccValues.size()))
+                ccValues[static_cast<size_t>(controller)] = static_cast<juce::uint8>(message.getControllerValue());
+            return;
+        }
+
+        if (message.isNoteOn())
+        {
+            const auto change = noteManager.noteOn(message.getNoteNumber(), message.getVelocity());
+            if (change.hasNote)
+            {
+                setTargetFrequency(change.note);
+                velocityScale = static_cast<float>(change.velocity) / 127.0f;
+
+                if (currentFrequency <= 0.0f)
+                    currentFrequency = targetFrequency;
+
+                envelope.noteOn(change.retriggerEnvelope);
+            }
+            return;
+        }
+
+        if (message.isNoteOff())
+        {
+            const auto change = noteManager.noteOff(message.getNoteNumber());
+
+            if (change.hasNote)
+            {
+                setTargetFrequency(change.note);
+                velocityScale = static_cast<float>(change.velocity) / 127.0f;
+            }
+            else
+            {
+                velocityScale = 0.0f;
+                envelope.noteOff();
+            }
+        }
+    }
+
+    void render(juce::AudioBuffer<float>& buffer, int startSample, int numSamples)
+    {
+        if (numSamples <= 0)
+            return;
+
+        auto* left = buffer.getWritePointer(0, startSample);
+        float* right = buffer.getNumChannels() > 1 ? buffer.getWritePointer(1, startSample) : nullptr;
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const auto haveNote = noteManager.hasActiveNote();
+            const auto envelopeActive = envelope.isActive();
+
+            if (!haveNote && !envelopeActive)
+            {
+                left[i] = 0.0f;
+                if (right != nullptr)
+                    right[i] = 0.0f;
+                continue;
+            }
+
+            currentFrequency += (targetFrequency - currentFrequency) * glideCoeff;
+            const auto vibratoValue = vibrato.processSample();
+            const auto frequency = applyVibrato(currentFrequency, vibratoValue, vibratoDepthSemitones);
+            oscillator.setFrequency(frequency);
+
+            const auto osc = oscillator.processSample();
+            const auto env = envelope.process();
+            const auto sample = osc * env * velocityScale * outputGain * 0.2f;
+
+            left[i] = sample;
+            if (right != nullptr)
+                right[i] = sample;
+        }
+    }
+
+private:
+    void setTargetFrequency(int midiNote)
+    {
+        const auto baseFreq = midiNoteToFrequency(midiNote);
+        targetFrequency = applyPitchBend(baseFreq, pitchBendValue);
+    }
+
+    MonoNoteManager noteManager;
+    BandlimitedSaw oscillator;
+    VibratoLFO vibrato;
+    AREnvelope envelope;
+
+    std::array<juce::uint8, 128> ccValues{};
+    double sampleRate = 44100.0;
+    float glideCoeff = 1.0f;
+    float vibratoDepthSemitones = 0.0f;
+    float currentFrequency = 0.0f;
+    float targetFrequency = 0.0f;
+    float outputGain = 1.0f;
+    float velocityScale = 0.0f;
+    int pitchBendValue = 8192;
+    int midiChannel = 0;
+};
+
+MonoNoteManager::Priority priorityFromIndex(int index)
+{
+    switch (index)
+    {
+        case 1:
+            return MonoNoteManager::Priority::Low;
+        case 2:
+            return MonoNoteManager::Priority::High;
+        default:
+            return MonoNoteManager::Priority::Last;
+    }
+}
 
 AlpacaAudioProcessor::AlpacaAudioProcessor()
     : juce::AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       parameters(*this, nullptr, "Parameters", alpaca::parameters::createParameterLayout())
 {
+    voiceEngine = std::make_unique<VoiceEngine>();
 }
 
 const juce::String AlpacaAudioProcessor::getName() const
@@ -70,10 +646,19 @@ void AlpacaAudioProcessor::changeProgramName(int index, const juce::String& newN
 
 void AlpacaAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
-    juce::ignoreUnused(sampleRate, samplesPerBlock);
+    juce::ignoreUnused(samplesPerBlock);
+    if (voiceEngine != nullptr)
+    {
+        voiceEngine->prepare(sampleRate);
+        voiceEngine->reset();
+    }
 }
 
-void AlpacaAudioProcessor::releaseResources() {}
+void AlpacaAudioProcessor::releaseResources()
+{
+    if (voiceEngine != nullptr)
+        voiceEngine->reset();
+}
 
 bool AlpacaAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 {
@@ -88,10 +673,35 @@ bool AlpacaAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) co
 void AlpacaAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                                         juce::MidiBuffer& midiMessages)
 {
-    juce::ignoreUnused(midiMessages);
     juce::ScopedNoDenormals noDenormals;
 
     buffer.clear();
+
+    const auto snapshot = ParamSnapshot::from(parameters);
+    if (voiceEngine != nullptr)
+    {
+        voiceEngine->setPriority(priorityFromIndex(snapshot.monoPriorityIndex));
+        voiceEngine->updateParameters(snapshot);
+
+        int currentSample = 0;
+        for (const auto metadata : midiMessages)
+        {
+            const auto eventSample = juce::jlimit(0, buffer.getNumSamples(), metadata.samplePosition);
+            const auto samplesToProcess = eventSample - currentSample;
+            if (samplesToProcess > 0)
+                voiceEngine->render(buffer, currentSample, samplesToProcess);
+
+            voiceEngine->processMidiMessage(metadata.getMessage());
+            currentSample = eventSample;
+        }
+
+        const auto remaining = buffer.getNumSamples() - currentSample;
+        if (remaining > 0)
+            voiceEngine->render(buffer, currentSample, remaining);
+    }
+
+    for (int channel = 2; channel < buffer.getNumChannels(); ++channel)
+        buffer.clear(channel, 0, buffer.getNumSamples());
 }
 
 bool AlpacaAudioProcessor::hasEditor() const

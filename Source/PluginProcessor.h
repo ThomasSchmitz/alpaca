@@ -10,8 +10,11 @@
 #pragma once
 
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <memory>
 
 #include "Parameters.h"
+
+struct VoiceEngine;
 
 class AlpacaAudioProcessor : public juce::AudioProcessor
 {
@@ -48,5 +51,7 @@ public:
     juce::AudioProcessorValueTreeState parameters;
 
 private:
+    std::unique_ptr<VoiceEngine> voiceEngine;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AlpacaAudioProcessor)
 };
